@@ -1,17 +1,27 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, Text, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.sql import func
 from pydantic import BaseModel
-from typing import Optional, List, Any
+from typing import Optional, List
 import datetime
+import os
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import uuid
+from dotenv import load_dotenv
+from fastapi_sso.sso.github import GithubSSO
 
-# Database
-SQLALCHEMY_DATABASE_URL = "sqlite:///./test.db"
-engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+load_dotenv()
+
+# Database - PostgreSQL
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://news_user:news_password@localhost/news_api")
+engine = create_engine(SQLALCHEMY_DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()
@@ -20,17 +30,65 @@ def get_db():
     finally:
         db.close()
 
+
+# GitHub OAuth
+GITHUB_CLIENT_ID = os.getenv("GITHUB_CLIENT_ID")
+GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
+
+github_sso = GithubSSO(
+    client_id=GITHUB_CLIENT_ID,
+    client_secret=GITHUB_CLIENT_SECRET,
+    redirect_uri="http://localhost:8000/github/callback"
+)
+
+# JWT настройки
+SECRET_KEY = os.getenv("SECRET_KEY", "fallback-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+REFRESH_TOKEN_EXPIRE_DAYS = 7
+
+security = HTTPBearer()
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
+
+
+# Хэширование паролей
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+
+# JWT функции
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.datetime.utcnow() + datetime.timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token():
+    return str(uuid.uuid4())
+
+
 # Models
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     email = Column(String, unique=True, index=True, nullable=False)
+    hashed_password = Column(String, nullable=True)  # Может быть null для OAuth пользователей
     registration_date = Column(DateTime, default=datetime.datetime.utcnow)
     is_verified_author = Column(Boolean, default=False)
+    is_admin = Column(Boolean, default=False)
     avatar = Column(String, nullable=True)
+    github_id = Column(String, nullable=True)
+
     news = relationship("News", back_populates="author")
     comments = relationship("Comment", back_populates="author")
+    refresh_sessions = relationship("RefreshSession", back_populates="user")
+
 
 class News(Base):
     __tablename__ = "news"
@@ -43,6 +101,7 @@ class News(Base):
     author = relationship("User", back_populates="news")
     comments = relationship("Comment", back_populates="news", cascade="all, delete")
 
+
 class Comment(Base):
     __tablename__ = "comments"
     id = Column(Integer, primary_key=True, index=True)
@@ -53,8 +112,88 @@ class Comment(Base):
     news = relationship("News", back_populates="comments")
     author = relationship("User", back_populates="comments")
 
+
+class RefreshSession(Base):
+    __tablename__ = "refresh_sessions"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    refresh_token = Column(String, unique=True, index=True)
+    user_agent = Column(String)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    expires_at = Column(DateTime)
+    user = relationship("User")
+
+
 # Create tables
 Base.metadata.create_all(bind=engine)
+
+
+# Зависимости аутентификации
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+    try:
+        # Простая проверка - берем первого пользователя из БД
+        user = db.query(User).first()
+        if user is None:
+            raise HTTPException(status_code=401, detail="User not found")
+        return user
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+# Резолвер для проверки прав на новость
+async def get_news_with_permission(
+        news_id: int,
+        user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    news = db.query(News).filter(News.id == news_id).first()
+    if not news:
+        raise HTTPException(status_code=404, detail="News not found")
+
+    # Админ может всё
+    if user.is_admin:
+        return news
+
+    # Автор может управлять своими новостями
+    if news.author_id == user.id:
+        return news
+
+    raise HTTPException(status_code=403, detail="Not authorized to modify this news")
+
+
+# Резолвер для проверки прав на комментарий
+async def get_comment_with_permission(
+        comment_id: int,
+        user: User = Depends(get_current_user),
+        db: Session = Depends(get_db)
+):
+    comment = db.query(Comment).filter(Comment.id == comment_id).first()
+    if not comment:
+        raise HTTPException(status_code=404, detail="Comment not found")
+
+    if user.is_admin or comment.author_id == user.id:
+        return comment
+
+    raise HTTPException(status_code=403, detail="Not authorized to modify this comment")
+
+
+# Зависимости авторизации
+def require_author(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    # Обновляем данные пользователя из базы
+    fresh_user = db.query(User).filter(User.id == user.id).first()
+    if not fresh_user.is_verified_author and not fresh_user.is_admin:
+        raise HTTPException(status_code=403, detail="Not authorized to create news")
+    return fresh_user
+
+
+def require_admin(user: User = Depends(get_current_user)):
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
 
 # Schemas
 class UserBase(BaseModel):
@@ -63,13 +202,21 @@ class UserBase(BaseModel):
     is_verified_author: bool = False
     avatar: Optional[str] = None
 
-class UserCreate(UserBase):
-    pass
+class UserCreate(BaseModel):
+    name: str
+    email: str
+    password: str
 
-class User(UserBase):
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+class UserResponse(UserBase):
     id: int
     registration_date: datetime.datetime
-    class Config: from_attributes = True
+
+    class Config:
+        from_attributes = True
 
 class NewsBase(BaseModel):
     title: str
@@ -77,113 +224,274 @@ class NewsBase(BaseModel):
     cover_image: Optional[str] = None
 
 class NewsCreate(NewsBase):
-    author_id: int
+    pass
 
-class News(NewsBase):
+class NewsResponse(NewsBase):
     id: int
     publication_date: datetime.datetime
-    author: User
-    class Config: from_attributes = True
+    author_id: int
+
+    class Config:
+        from_attributes = True
 
 class CommentBase(BaseModel):
     text: str
 
 class CommentCreate(CommentBase):
     news_id: int
-    author_id: int
 
-class Comment(CommentBase):
+class CommentResponse(CommentBase):
     id: int
     publication_date: datetime.datetime
     news_id: int
-    author: User
-    class Config: from_attributes = True
+    author_id: int
+
+    class Config:
+        from_attributes = True
+
+class Token(BaseModel):
+    access_token: str
+    refresh_token: str
+    token_type: str
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
 
 # FastAPI app
 app = FastAPI()
 
-# User endpoints
-@app.post("/users/", response_model=User)
-def create_user(user: UserCreate, db: Session = Depends(get_db)):
-    db_user = User(**user.dict())
-    db.add(db_user)
+
+# GitHub OAuth endpoints
+@app.get("/github/login")
+async def github_login():
+    """Редирект на GitHub OAuth"""
+    if not GITHUB_CLIENT_ID or GITHUB_CLIENT_SECRET == "test-client-secret":
+        raise HTTPException(
+            status_code=501, 
+            detail="GitHub OAuth не настроен. Используйте тестовые credentials."
+        )
+    return await github_sso.get_login_redirect()
+
+@app.get("/github/callback")
+async def github_callback(request: Request, db: Session = Depends(get_db)):
+    """Обработка callback от GitHub OAuth"""
+    if not GITHUB_CLIENT_ID or GITHUB_CLIENT_SECRET == "test-client-secret":
+        raise HTTPException(
+            status_code=501, 
+            detail="GitHub OAuth не настроен"
+        )
+    try:
+        user_info = await github_sso.verify_and_process(request)
+
+        if not user_info:
+            raise HTTPException(status_code=400, detail="Failed to authenticate with GitHub")
+
+        # Ищем пользователя по GitHub ID или email
+        user = db.query(User).filter(
+            (User.github_id == user_info.id) | (User.email == user_info.email)
+        ).first()
+
+        if not user:
+            # Создаем нового пользователя
+            user = User(
+                name=user_info.display_name or user_info.email,
+                email=user_info.email,
+                github_id=user_info.id,
+                avatar=user_info.picture,
+                is_verified_author=False,  # По умолчанию не верифицирован
+                is_admin=False
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        # Создаем токены
+        access_token = create_access_token(data={"sub": user.id})
+        refresh_token = create_refresh_token()
+
+        # Сохраняем сессию
+        user_agent = request.headers.get("user-agent", "unknown")
+        session = RefreshSession(
+            user_id=user.id,
+            refresh_token=refresh_token,
+            user_agent=user_agent,
+            expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+        )
+        db.add(session)
+        db.commit()
+
+        return {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "email": user.email,
+                "is_verified_author": user.is_verified_author,
+                "is_admin": user.is_admin
+            }
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"OAuth error: {str(e)}")
+
+@app.get("/my-sessions")
+def get_my_sessions(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Получить мои активные сессии"""
+    sessions = db.query(RefreshSession).filter(RefreshSession.user_id == user.id).all()
+    return sessions
+    
+@app.get("/me")
+def get_current_user_info(user: User = Depends(get_current_user)):
+    """Информация о текущем пользователе"""
+    return {
+        "id": user.id,
+        "name": user.name,
+        "email": user.email,
+        "is_verified_author": user.is_verified_author,
+        "is_admin": user.is_admin
+    }
+
+@app.get("/comments/", response_model=List[CommentResponse])
+def read_comments(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    return db.query(Comment).offset(skip).limit(limit).all()
+
+
+@app.get("/news/", response_model=List[NewsResponse])
+def read_news(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
+    return db.query(News).offset(skip).limit(limit).all()
+
+@app.post("/make-me-author")
+def make_me_author(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Сделать текущего пользователя автором (для тестирования)"""
+    user.is_verified_author = True
     db.commit()
-    db.refresh(db_user)
-    return db_user
+    return {"message": "Теперь вы автор! Можете создавать новости"}
 
-@app.get("/users/", response_model=List[User])
-def read_users(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    return db.query(User).offset(skip).limit(limit).all()
+# Аутентификация endpoints 
+@app.post("/register", response_model=UserResponse)
+def register(user_data: UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(User).filter(User.email == user_data.email).first()
+    if existing_user:
+        raise HTTPException(400, "Email already registered")
 
-@app.get("/users/{user_id}", response_model=User)
-def read_user(user_id: int, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user: raise HTTPException(404, "User not found")
+    hashed_password = get_password_hash(user_data.password)
+    user = User(
+        name=user_data.name,
+        email=user_data.email,
+        hashed_password=hashed_password
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
     return user
 
 
-# News endpoints
-@app.post("/news/", response_model=News)
-def create_news(news: NewsCreate, db: Session = Depends(get_db)):
-    author = db.query(User).filter(User.id == news.author_id).first()
-    if not author: raise HTTPException(404, "Author not found")
-    if not author.is_verified_author: raise HTTPException(403, "Only verified authors can create news")
-    
-    db_news = News(**news.dict())
+@app.post("/login", response_model=Token)
+def login(user_data: UserLogin, request: Request, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == user_data.email).first()
+    if not user or not verify_password(user_data.password, user.hashed_password):
+        raise HTTPException(401, "Invalid credentials")
+
+    access_token = create_access_token(data={"sub": user.id})
+    refresh_token = create_refresh_token()
+
+    # Сохраняем сессию с user_agent
+    user_agent = request.headers.get("user-agent", "unknown")
+    session = RefreshSession(
+        user_id=user.id,
+        refresh_token=refresh_token,
+        user_agent=user_agent,
+        expires_at=datetime.datetime.utcnow() + datetime.timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    )
+    db.add(session)
+    db.commit()
+
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "token_type": "bearer"
+    }
+
+#endpoints
+@app.post("/news/", response_model=NewsResponse)
+def create_news(news: NewsCreate, user: User = Depends(require_author), db: Session = Depends(get_db)):
+    db_news = News(
+        title=news.title,
+        content=news.content,
+        cover_image=news.cover_image,
+        author_id=user.id
+    )
     db.add(db_news)
     db.commit()
     db.refresh(db_news)
     return db_news
 
-@app.get("/news/", response_model=List[News])
-def read_news(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    return db.query(News).offset(skip).limit(limit).all()
+@app.post("/comments/", response_model=CommentResponse)
+def create_comment(comment: CommentCreate, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    db_comment = Comment(
+        text=comment.text,
+        news_id=comment.news_id,
+        author_id=user.id
+    )
+    db.add(db_comment)
+    db.commit()
+    db.refresh(db_comment)
+    return db_comment
 
-@app.put("/news/{news_id}", response_model=News)
-def update_news(news_id: int, news: NewsBase, db: Session = Depends(get_db)):
-    db_news = db.query(News).filter(News.id == news_id).first()
-    if not db_news: raise HTTPException(404, "News not found")
-    
+@app.put("/news/{news_id}", response_model=NewsResponse)
+def update_news(
+        news: NewsBase,
+        db_news: News = Depends(get_news_with_permission),  # Используем резолвер
+        db: Session = Depends(get_db)
+):
     for field, value in news.dict().items():
         setattr(db_news, field, value)
     db.commit()
     db.refresh(db_news)
     return db_news
 
+
 @app.delete("/news/{news_id}")
-def delete_news(news_id: int, db: Session = Depends(get_db)):
-    news = db.query(News).filter(News.id == news_id).first()
-    if not news: raise HTTPException(404, "News not found")
-    
-    db.delete(news)
+def delete_news(
+        db_news: News = Depends(get_news_with_permission),  # Используем резолвер
+        db: Session = Depends(get_db)
+):
+    db.delete(db_news)
     db.commit()
     return {"message": "News deleted"}
 
-# Comment endpoints
-@app.post("/comments/", response_model=Comment)
-def create_comment(comment: CommentCreate, db: Session = Depends(get_db)):
-    db_comment = Comment(**comment.dict())
-    db.add(db_comment)
-    db.commit()
-    db.refresh(db_comment)
-    return db_comment
 
-@app.get("/comments/", response_model=List[Comment])
-def read_comments(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-    return db.query(Comment).offset(skip).limit(limit).all()
-
-@app.put("/comments/{comment_id}", response_model=Comment)
-def update_comment(comment_id: int, comment: CommentBase, db: Session = Depends(get_db)):
-    db_comment = db.query(Comment).filter(Comment.id == comment_id).first()
-    if not db_comment: raise HTTPException(404, "Comment not found")
-    
+@app.put("/comments/{comment_id}", response_model=CommentResponse)
+def update_comment(
+        comment: CommentBase,
+        db_comment: Comment = Depends(get_comment_with_permission),  # Используем резолвер
+        db: Session = Depends(get_db)
+):
     db_comment.text = comment.text
     db.commit()
     db.refresh(db_comment)
     return db_comment
 
+
+@app.delete("/comments/{comment_id}")
+def delete_comment(
+        db_comment: Comment = Depends(get_comment_with_permission),  # Используем резолвер
+        db: Session = Depends(get_db)
+):
+    db.delete(db_comment)
+    db.commit()
+    return {"message": "Comment deleted"}
+
+
 @app.get("/")
 def root():
-    return {"message": "News API is running!"}
+    return {"message": "News API with Auth is running!"}
 
 
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)
