@@ -2,7 +2,9 @@
 venv/
 
 # Python cache
-pycache/
+__pycache__/
+*.pyc
+*.dbpycache/
 *.pyc
 *.pyo
 
