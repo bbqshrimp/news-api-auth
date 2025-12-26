@@ -4,3 +4,10 @@ sqlalchemy==2.0.23
 alembic==1.12.1
 psycopg2-binary==2.9.9
 pydantic==2.5.0
+redis==4.5.4
+celery==5.3.4
+python-dotenv==1.0.0
+python-jose==3.3.0
+passlib[argon2]==1.7.4
+fastapi-sso==0.3.0
+
